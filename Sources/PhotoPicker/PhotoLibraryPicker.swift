@@ -1,4 +1,5 @@
 import SwiftUI
+import AVFoundation
 import Photos
 import PhotosUI
 import UniformTypeIdentifiers
@@ -805,29 +806,36 @@ final class PhotoLibraryModel: ObservableObject {
     }
 
     func exportVideo(for asset: PHAsset) async -> URL? {
-        let resources = PHAssetResource.assetResources(for: asset)
-        let videoResource = resources.first { $0.type == .video }
-            ?? resources.first { $0.type == .fullSizeVideo }
-            ?? resources.first { $0.type == .pairedVideo }
-        guard let resource = videoResource else { return nil }
+        // Ask PhotoKit to compose the asset with its *current* adjustments
+        // applied (trims, etc). Picking the `.video` PHAssetResource and
+        // writing its raw bytes would always return the unedited original,
+        // since edits in Photos are stored as a separate adjustment layer.
+        let options = PHVideoRequestOptions()
+        options.isNetworkAccessAllowed = true
+        options.deliveryMode = .highQualityFormat
+        options.version = .current
 
-        let ext = (resource.originalFilename as NSString).pathExtension
-        let suffix = ext.isEmpty ? "" : ".\(ext)"
         let dest = FileManager.default.temporaryDirectory
-            .appendingPathComponent("photopicker-\(UUID().uuidString)\(suffix)")
+            .appendingPathComponent("photopicker-\(UUID().uuidString).mov")
         try? FileManager.default.removeItem(at: dest)
 
-        let resumer = ResumeOnce<URL?>()
-        return await withCheckedContinuation { (continuation: CheckedContinuation<URL?, Never>) in
-            let opts = PHAssetResourceRequestOptions()
-            opts.isNetworkAccessAllowed = true
-            PHAssetResourceManager.default().writeData(
-                for: resource,
-                toFile: dest,
-                options: opts
-            ) { error in
-                resumer.tryResume(continuation, with: error == nil ? dest : nil)
+        let resumer = ResumeOnce<AVAssetExportSession?>()
+        let session = await withCheckedContinuation { (continuation: CheckedContinuation<AVAssetExportSession?, Never>) in
+            PHImageManager.default().requestExportSession(
+                forVideo: asset,
+                options: options,
+                exportPreset: AVAssetExportPresetPassthrough
+            ) { session, _ in
+                resumer.tryResume(continuation, with: session)
             }
+        }
+        guard let session else { return nil }
+
+        do {
+            try await session.export(to: dest, as: .mov)
+            return dest
+        } catch {
+            return nil
         }
     }
 }
