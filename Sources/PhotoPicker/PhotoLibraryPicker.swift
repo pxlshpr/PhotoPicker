@@ -550,10 +550,70 @@ public final class PhotoLibraryPrewarmer: NSObject, ObservableObject, PHPhotoLib
         // Pre-warm the two filters most pickers use.
         // `.images` covers single-image flows; `.any` covers picker flows that
         // accept both photos and videos. `.videos` is rare and fetched on demand.
-        ensureFetched(.images)
-        ensureFetched(.any)
-        prefetchInitialThumbnails()
+        //
+        // #1690 — do the heavy PhotoKit work OFF the main actor. `PHAsset.fetchAssets`
+        // (a full creationDate-sorted fetch result over the whole library) and the
+        // `PHFetchResult.object(at:)` faulting of the first 60 assets are thread-safe
+        // off-main; only the `@Published` assignment and the `PHCachingImageManager`
+        // registration hop back to the main actor. On a large library these fetches +
+        // the 60-asset fault were a 240–410 ms main-thread stall ~1.5 s into launch.
+        refreshFetchesOffMain(filters: [.images, .any], overwrite: false)
         prewarmAlbums()
+    }
+
+    /// Re-fetches `filters` on a background queue and publishes the results (plus the
+    /// initial thumbnail-prefetch set) on a single `@MainActor` hop. `overwrite=false`
+    /// preserves any result a synchronous `ensureFetched` already cached (avoids a race
+    /// clobbering a just-fetched value). (#1690)
+    private func refreshFetchesOffMain(filters: [PhotoLibraryPicker.Filter], overwrite: Bool) {
+        guard !filters.isEmpty else { return }
+        Task.detached(priority: .utility) { [weak self] in
+            let fetched = filters.map { ($0, Self.fetch(filter: $0)) }
+            let primary = fetched.first(where: { $0.0 == .images })?.1 ?? fetched.first?.1
+            let fallback = fetched.first(where: { $0.0 == .any })?.1
+            let prefetch: [PHAsset] = primary.map {
+                Self.collectInitialPrefetchAssets(from: $0, fallback: fallback ?? $0)
+            } ?? []
+            await MainActor.run {
+                guard let self else { return }
+                for (filter, result) in fetched where overwrite || self.fetchResults[filter] == nil {
+                    self.fetchResults[filter] = result
+                }
+                self.cachingManager.stopCachingImagesForAllAssets()
+                self.startCaching(prefetch)
+            }
+        }
+    }
+
+    /// Builds the array of the first `initialPrefetchCount` assets to warm. Runs off the
+    /// main actor — `object(at:)` triggers a synchronous PhotoKit fault per asset. (#1690)
+    nonisolated private static func collectInitialPrefetchAssets(
+        from primary: PHFetchResult<PHAsset>,
+        fallback: PHFetchResult<PHAsset>
+    ) -> [PHAsset] {
+        let result = primary.count > 0 ? primary : fallback
+        guard result.count > 0 else { return [] }
+        let count = min(initialPrefetchCount, result.count)
+        var assets: [PHAsset] = []
+        assets.reserveCapacity(count)
+        for i in 0..<count { assets.append(result.object(at: i)) }
+        return assets
+    }
+
+    /// Registers the prefetch set with the caching manager. Must run on the main actor
+    /// (the `cachingManager` is `@MainActor`-stored). (#1690)
+    private func startCaching(_ assets: [PHAsset]) {
+        guard !assets.isEmpty else { return }
+        let options = PHImageRequestOptions()
+        options.deliveryMode = .opportunistic
+        options.resizeMode = .fast
+        options.isNetworkAccessAllowed = true
+        cachingManager.startCachingImages(
+            for: assets,
+            targetSize: Self.thumbnailTargetSize,
+            contentMode: .aspectFill,
+            options: options
+        )
     }
 
     private func prewarmAlbums() {
@@ -619,40 +679,20 @@ public final class PhotoLibraryPrewarmer: NSObject, ObservableObject, PHPhotoLib
         observerRegistered = true
     }
 
-    private static func fetch(filter: PhotoLibraryPicker.Filter) -> PHFetchResult<PHAsset> {
+    nonisolated private static func fetch(filter: PhotoLibraryPicker.Filter) -> PHFetchResult<PHAsset> {
         PHAsset.fetchAssets(with: PhotoLibraryFetcher.defaultOptions(for: filter))
     }
 
-    private func prefetchInitialThumbnails() {
-        cachingManager.stopCachingImagesForAllAssets()
-        // Prefer `.images` for prefetch (most common picker flow).
-        let result = fetchResults[.images] ?? fetchResults[.any]
-        guard let result, result.count > 0 else { return }
-        let count = min(Self.initialPrefetchCount, result.count)
-        var toPrefetch: [PHAsset] = []
-        toPrefetch.reserveCapacity(count)
-        for i in 0..<count {
-            toPrefetch.append(result.object(at: i))
-        }
-        let options = PHImageRequestOptions()
-        options.deliveryMode = .opportunistic
-        options.resizeMode = .fast
-        options.isNetworkAccessAllowed = true
-        cachingManager.startCachingImages(
-            for: toPrefetch,
-            targetSize: Self.thumbnailTargetSize,
-            contentMode: .aspectFill,
-            options: options
-        )
-    }
-
     public nonisolated func photoLibraryDidChange(_ changeInstance: PHChange) {
+        // #1690 — a library mutation while foregrounded used to re-run the full
+        // `PHAsset.fetchAssets` + 60-asset fault synchronously on the main actor. Route it
+        // through the same off-main refresh as `prewarm()` so it never blocks the main
+        // thread (matters on devices actively syncing iCloud photos, where this fires often).
         Task { @MainActor in
-            // Re-fetch every filter we'd already cached.
-            for filter in self.fetchResults.keys {
-                self.fetchResults[filter] = Self.fetch(filter: filter)
+            let cachedFilters = Array(self.fetchResults.keys)
+            if !cachedFilters.isEmpty {
+                self.refreshFetchesOffMain(filters: cachedFilters, overwrite: true)
             }
-            self.prefetchInitialThumbnails()
             self.prewarmAlbums()
         }
     }

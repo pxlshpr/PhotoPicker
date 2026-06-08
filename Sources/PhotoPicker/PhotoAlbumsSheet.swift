@@ -289,7 +289,14 @@ struct PhotoAlbumsSheet: View {
     }
 
     private func sortByRecent(_ albums: [PhotoAlbum]) -> [PhotoAlbum] {
-        let sorted = albums.sorted { lhs, rhs in
+        // #1690 — pure sort. This is called 3× per `recentList` body evaluation, and
+        // SwiftUI re-runs the body on every search keystroke, sort-order change, and
+        // prewarmer `@Published` album publish. The previous per-call `ISO8601DateFormatter`
+        // allocation + `RemoteLogger.shared.info` ("album-sort") network POST therefore ran
+        // dozens of times on the main actor while the All-Albums sheet was open — the source
+        // of the in-session 170–500 ms main-thread blocks. Per-album metadata is still logged
+        // (off-main) by `logAlbumMetadata` during enumeration if that telemetry is needed.
+        albums.sorted { lhs, rhs in
             switch (lhs.lastAssetDate, rhs.lastAssetDate) {
             case let (l?, r?): return l > r
             case (_?, nil): return true
@@ -297,26 +304,6 @@ struct PhotoAlbumsSheet: View {
             case (nil, nil): return false
             }
         }
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime]
-        let kindLabel: String = {
-            guard let k = sorted.first?.kind else { return "empty" }
-            switch k {
-            case .pinned: return "pinned"
-            case .userCreated: return "userCreated"
-            case .system: return "system"
-            case .app: return "app"
-            }
-        }()
-        let summary = sorted.prefix(15).map { album -> String in
-            let date = album.lastAssetDate.map { formatter.string(from: $0) } ?? "nil"
-            return "\(album.title)=\(date)"
-        }.joined(separator: " | ")
-        RemoteLogger.shared.info(
-            "sortByRecent kind=\(kindLabel) n=\(sorted.count) top15: \(summary)",
-            category: "album-sort"
-        )
-        return sorted
     }
 
     private func loadIfNeeded() async {
