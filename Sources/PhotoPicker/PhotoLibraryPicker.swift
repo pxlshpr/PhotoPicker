@@ -3,7 +3,6 @@ import AVFoundation
 import Photos
 import PhotosUI
 import UniformTypeIdentifiers
-import RemoteLogger
 
 /// Identifies which slice of the photo library the picker grid is currently showing.
 ///
@@ -526,6 +525,22 @@ public final class PhotoLibraryPrewarmer: NSObject, ObservableObject, PHPhotoLib
     private var observerRegistered = false
     private var lifecycleObserverRegistered = false
     private var isLoadingAlbums = false
+    /// A change/lifecycle trigger arrived while an album load was in flight — run one more
+    /// load when it finishes instead of dropping the trigger (the old behaviour silently
+    /// skipped it, leaving the albums stale until the next trigger).
+    private var albumsDirty = false
+    /// When the last album load finished — recency gate for lifecycle re-warms.
+    private var lastAlbumWarm: Date?
+    /// Trailing debounce for `photoLibraryDidChange` storms (iCloud Photo Library sync fires
+    /// it for every change batch — dozens of times in a burst).
+    private var pendingChangeRefresh: Task<Void, Never>?
+    /// The last prefetch set handed to `cachingManager`, by asset id — lets a refresh skip
+    /// the stop/start-caching round-trip when the leading assets haven't changed.
+    private var lastPrefetchIDs: [String] = []
+
+    /// Lifecycle re-warms (didBecomeActive) skip the album reload entirely when the last one
+    /// finished more recently than this — the change observer already covers real mutations.
+    private static let albumWarmMaxAge: TimeInterval = 10 * 60
 
     private override init() { super.init() }
 
@@ -574,13 +589,23 @@ public final class PhotoLibraryPrewarmer: NSObject, ObservableObject, PHPhotoLib
             let prefetch: [PHAsset] = primary.map {
                 Self.collectInitialPrefetchAssets(from: $0, fallback: fallback ?? $0)
             } ?? []
+            // Identifiers computed off-main so the hop below can diff without touching PhotoKit.
+            let prefetchIDs = prefetch.map(\.localIdentifier)
             await MainActor.run {
                 guard let self else { return }
                 for (filter, result) in fetched where overwrite || self.fetchResults[filter] == nil {
                     self.fetchResults[filter] = result
                 }
-                self.cachingManager.stopCachingImagesForAllAssets()
-                self.startCaching(prefetch)
+                // Restart caching only when the leading assets actually changed. The
+                // stop/start pair is a synchronous XPC round-trip to photolibraryd — during an
+                // iCloud sync burst the daemon is saturated and each call can block the main
+                // thread for seconds, and the change observer fires for every batch, so the
+                // unconditional restart compounded into multi-second main-thread stalls (#2171).
+                if prefetchIDs != self.lastPrefetchIDs {
+                    self.lastPrefetchIDs = prefetchIDs
+                    self.cachingManager.stopCachingImagesForAllAssets()
+                    self.startCaching(prefetch)
+                }
             }
         }
     }
@@ -617,7 +642,12 @@ public final class PhotoLibraryPrewarmer: NSObject, ObservableObject, PHPhotoLib
     }
 
     private func prewarmAlbums() {
-        guard !isLoadingAlbums else { return }
+        // Coalesce, don't drop: a trigger landing mid-load runs exactly one more load when
+        // the in-flight one finishes, so albums always converge on the latest library state.
+        guard !isLoadingAlbums else {
+            albumsDirty = true
+            return
+        }
         let status = PHPhotoLibrary.authorizationStatus(for: .readWrite)
         guard status == .authorized || status == .limited else { return }
         isLoadingAlbums = true
@@ -642,8 +672,24 @@ public final class PhotoLibraryPrewarmer: NSObject, ObservableObject, PHPhotoLib
                 p.smartAlbumsByFilter[.any] = aSmart
                 p.userAlbumsByFilter[.any] = aUser
                 p.isLoadingAlbums = false
+                p.lastAlbumWarm = Date()
+                if p.albumsDirty {
+                    p.albumsDirty = false
+                    p.prewarmAlbums()
+                }
             }
         }
+    }
+
+    /// Lifecycle re-warm: only reload albums when the cache is genuinely old. Every
+    /// foreground used to re-enumerate every album ×2 filters unconditionally; on a large
+    /// library that's a multi-second `photolibraryd` barrage on each app switch, and the
+    /// change observer already refreshes on real mutations (#2171).
+    private func prewarmAlbumsIfStale() {
+        if let lastAlbumWarm, Date().timeIntervalSince(lastAlbumWarm) < Self.albumWarmMaxAge {
+            return
+        }
+        prewarmAlbums()
     }
 
     private func registerLifecycleObserver() {
@@ -654,7 +700,7 @@ public final class PhotoLibraryPrewarmer: NSObject, ObservableObject, PHPhotoLib
             queue: .main
         ) { _ in
             Task { @MainActor in
-                PhotoLibraryPrewarmer.shared.prewarmAlbums()
+                PhotoLibraryPrewarmer.shared.prewarmAlbumsIfStale()
             }
         }
         lifecycleObserverRegistered = true
@@ -688,12 +734,23 @@ public final class PhotoLibraryPrewarmer: NSObject, ObservableObject, PHPhotoLib
         // `PHAsset.fetchAssets` + 60-asset fault synchronously on the main actor. Route it
         // through the same off-main refresh as `prewarm()` so it never blocks the main
         // thread (matters on devices actively syncing iCloud photos, where this fires often).
+        //
+        // #2171 — trailing-debounce the refresh. iCloud Photo Library sync posts a change per
+        // batch — dozens in a burst — and refreshing per change kept a continuous full-library
+        // + all-albums re-enumeration storm running against photolibraryd, starving the app
+        // (including the main runloop via the caching-manager hop) for tens of seconds. One
+        // refresh 3s after the last change of a burst yields the same end state.
         Task { @MainActor in
-            let cachedFilters = Array(self.fetchResults.keys)
-            if !cachedFilters.isEmpty {
-                self.refreshFetchesOffMain(filters: cachedFilters, overwrite: true)
+            self.pendingChangeRefresh?.cancel()
+            self.pendingChangeRefresh = Task { @MainActor [weak self] in
+                try? await Task.sleep(nanoseconds: 3_000_000_000)
+                guard let self, !Task.isCancelled else { return }
+                let cachedFilters = Array(self.fetchResults.keys)
+                if !cachedFilters.isEmpty {
+                    self.refreshFetchesOffMain(filters: cachedFilters, overwrite: true)
+                }
+                self.prewarmAlbums()
             }
-            self.prewarmAlbums()
         }
     }
 }
@@ -1008,19 +1065,6 @@ enum PhotoLibraryFetcher {
         let recents = PHAsset.fetchAssets(with: options)
         if recents.count > 0 {
             let first = recents.firstObject
-            logAlbumMetadata(
-                title: PhotoLibrarySource.recents.title,
-                count: recents.count,
-                firstAssetCreationDate: first?.creationDate,
-                firstAssetModificationDate: first?.modificationDate,
-                collectionStartDate: nil,
-                collectionEndDate: nil,
-                estimatedCount: nil,
-                subtypeRaw: nil,
-                canDelete: nil,
-                canRemoveContent: nil,
-                canAddContent: nil
-            )
             albums.append(PhotoAlbum(
                 id: "source.recents",
                 title: PhotoLibrarySource.recents.title,
@@ -1102,19 +1146,6 @@ enum PhotoLibraryFetcher {
         let result = PHAsset.fetchAssets(in: collection, options: albumSummaryOptions(for: filter))
         guard result.count > 0 else { return nil }
         let first = result.firstObject
-        logAlbumMetadata(
-            title: source.title,
-            count: result.count,
-            firstAssetCreationDate: first?.creationDate,
-            firstAssetModificationDate: first?.modificationDate,
-            collectionStartDate: collection.startDate,
-            collectionEndDate: collection.endDate,
-            estimatedCount: collection.estimatedAssetCount,
-            subtypeRaw: collection.assetCollectionSubtype.rawValue,
-            canDelete: collection.canPerform(.delete),
-            canRemoveContent: collection.canPerform(.removeContent),
-            canAddContent: collection.canPerform(.addContent)
-        )
         return PhotoAlbum(
             id: "source.\(source.title.lowercased())",
             title: source.title,
@@ -1141,19 +1172,6 @@ enum PhotoLibraryFetcher {
         let canDelete = collection.canPerform(.delete)
         let canRemove = collection.canPerform(.removeContent)
         let canAdd = collection.canPerform(.addContent)
-        logAlbumMetadata(
-            title: title,
-            count: result.count,
-            firstAssetCreationDate: first?.creationDate,
-            firstAssetModificationDate: first?.modificationDate,
-            collectionStartDate: collection.startDate,
-            collectionEndDate: collection.endDate,
-            estimatedCount: collection.estimatedAssetCount,
-            subtypeRaw: collection.assetCollectionSubtype.rawValue,
-            canDelete: canDelete,
-            canRemoveContent: canRemove,
-            canAddContent: canAdd
-        )
         // Heuristic: a fully-editable .albumRegular collection is a
         // user-created album from Photos.app. Anything that doesn't grant
         // the current app full edit rights is treated as an app-created
@@ -1174,39 +1192,9 @@ enum PhotoLibraryFetcher {
         )
     }
 
-    private static let albumLogFormatter: ISO8601DateFormatter = {
-        let f = ISO8601DateFormatter()
-        f.formatOptions = [.withInternetDateTime]
-        return f
-    }()
-
-    private static func logAlbumMetadata(
-        title: String,
-        count: Int,
-        firstAssetCreationDate: Date?,
-        firstAssetModificationDate: Date?,
-        collectionStartDate: Date?,
-        collectionEndDate: Date?,
-        estimatedCount: Int?,
-        subtypeRaw: Int?,
-        canDelete: Bool?,
-        canRemoveContent: Bool?,
-        canAddContent: Bool?
-    ) {
-        func fmt(_ d: Date?) -> String {
-            guard let d else { return "nil" }
-            return albumLogFormatter.string(from: d)
-        }
-        func fmtBool(_ b: Bool?) -> String {
-            b.map { $0 ? "Y" : "N" } ?? "n/a"
-        }
-        let estCount = estimatedCount.map { $0 == NSNotFound ? "NSNotFound" : "\($0)" } ?? "n/a"
-        let subtype = subtypeRaw.map(String.init) ?? "n/a"
-        RemoteLogger.shared.info(
-            "album=\"\(title)\" count=\(count) estCount=\(estCount) subtype=\(subtype) canDelete=\(fmtBool(canDelete)) canRemove=\(fmtBool(canRemoveContent)) canAdd=\(fmtBool(canAddContent)) firstAsset.creationDate=\(fmt(firstAssetCreationDate)) firstAsset.modificationDate=\(fmt(firstAssetModificationDate)) collection.startDate=\(fmt(collectionStartDate)) collection.endDate=\(fmt(collectionEndDate))",
-            category: "album-sort"
-        )
-    }
+    // (The per-album "album-sort" metadata logging that used to live here is gone — it was
+    // #1802 sort-order forensics, and once the album set is re-enumerated repeatedly during
+    // an iCloud sync burst it produced hundreds of network log POSTs per cycle. #2171.)
 }
 
 // MARK: - Helpers
