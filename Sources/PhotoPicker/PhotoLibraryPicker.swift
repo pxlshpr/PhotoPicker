@@ -55,6 +55,11 @@ public struct PhotoLibraryPicker: View {
     let onImageSelected: ((UIImage) -> Void)?
     let onImagesSelected: (([UIImage]) -> Void)?
     let onVideoSelected: ((URL) -> Void)?
+    /// Multi-select for videos: every selected video asset, exported to a
+    /// temp file in the order it was picked. Supplying this (with a
+    /// `selectionLimit` other than 1) turns the picker into a multi-select
+    /// picker for video assets, alongside `onImagesSelected` for images.
+    let onVideosSelected: (([URL]) -> Void)?
 
     @StateObject private var model: PhotoLibraryModel
     @ObservedObject private var prewarmer = PhotoLibraryPrewarmer.shared
@@ -68,7 +73,8 @@ public struct PhotoLibraryPicker: View {
         defaultSource: PhotoLibrarySource = .recents,
         onImageSelected: ((UIImage) -> Void)? = nil,
         onImagesSelected: (([UIImage]) -> Void)? = nil,
-        onVideoSelected: ((URL) -> Void)? = nil
+        onVideoSelected: ((URL) -> Void)? = nil,
+        onVideosSelected: (([URL]) -> Void)? = nil
     ) {
         self.filter = filter
         self.selectionLimit = selectionLimit
@@ -76,10 +82,13 @@ public struct PhotoLibraryPicker: View {
         self.onImageSelected = onImageSelected
         self.onImagesSelected = onImagesSelected
         self.onVideoSelected = onVideoSelected
+        self.onVideosSelected = onVideosSelected
         _model = StateObject(wrappedValue: PhotoLibraryModel(filter: filter, initialSource: defaultSource))
     }
 
-    private var isMultiSelect: Bool { onImagesSelected != nil && selectionLimit != 1 }
+    private var isMultiSelect: Bool {
+        (onImagesSelected != nil || onVideosSelected != nil) && selectionLimit != 1
+    }
 
     public var body: some View {
         NavigationStack {
@@ -243,14 +252,35 @@ public struct PhotoLibraryPicker: View {
         }
     }
 
+    /// Delivers the multi-selection: videos (exported in the order they
+    /// were picked) to `onVideosSelected` when any were chosen, else the
+    /// images to `onImagesSelected` — exactly one of the two fires, so a
+    /// caller wired for both never gets a pick delivered twice.
     private func finishMultiSelection() {
         showingAlbumsSheet = false
         isProcessing = true
         Task {
             let assets = model.selectedAssets
-            let images = await model.fullImages(for: assets)
+            let videoAssets = onVideosSelected != nil ? assets.filter { $0.mediaType == .video } : []
+            var videos: [URL] = []
+            videos.reserveCapacity(videoAssets.count)
+            for asset in videoAssets {
+                if let url = await model.exportVideo(for: asset) {
+                    videos.append(url)
+                }
+            }
+            let images: [UIImage]
+            if videos.isEmpty, onImagesSelected != nil {
+                images = await model.fullImages(for: assets.filter { $0.mediaType == .image })
+            } else {
+                images = []
+            }
             await MainActor.run {
-                onImagesSelected?(images)
+                if !videos.isEmpty {
+                    onVideosSelected?(videos)
+                } else {
+                    onImagesSelected?(images)
+                }
                 isProcessing = false
                 dismiss()
             }
