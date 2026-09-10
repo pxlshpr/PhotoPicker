@@ -60,6 +60,13 @@ public struct PhotoLibraryPicker: View {
     /// `selectionLimit` other than 1) turns the picker into a multi-select
     /// picker for video assets, alongside `onImagesSelected` for images.
     let onVideosSelected: (([URL]) -> Void)?
+    /// Like `onImagesSelected` / `onVideosSelected`, with each pick's
+    /// library identifier alongside — for callers that need to fetch the
+    /// same asset again later (`PhotoLibraryAssets`). Fire alongside the
+    /// plain callbacks, never instead of them; either turns on multi-select
+    /// the way its plain counterpart does.
+    let onPickedImages: (([PickedImage]) -> Void)?
+    let onPickedVideos: (([PickedVideo]) -> Void)?
 
     @StateObject private var model: PhotoLibraryModel
     @ObservedObject private var prewarmer = PhotoLibraryPrewarmer.shared
@@ -74,7 +81,9 @@ public struct PhotoLibraryPicker: View {
         onImageSelected: ((UIImage) -> Void)? = nil,
         onImagesSelected: (([UIImage]) -> Void)? = nil,
         onVideoSelected: ((URL) -> Void)? = nil,
-        onVideosSelected: (([URL]) -> Void)? = nil
+        onVideosSelected: (([URL]) -> Void)? = nil,
+        onPickedImages: (([PickedImage]) -> Void)? = nil,
+        onPickedVideos: (([PickedVideo]) -> Void)? = nil
     ) {
         self.filter = filter
         self.selectionLimit = selectionLimit
@@ -83,11 +92,21 @@ public struct PhotoLibraryPicker: View {
         self.onImagesSelected = onImagesSelected
         self.onVideoSelected = onVideoSelected
         self.onVideosSelected = onVideosSelected
+        self.onPickedImages = onPickedImages
+        self.onPickedVideos = onPickedVideos
         _model = StateObject(wrappedValue: PhotoLibraryModel(filter: filter, initialSource: defaultSource))
     }
 
+    private var wantsImages: Bool {
+        onImageSelected != nil || onImagesSelected != nil || onPickedImages != nil
+    }
+
+    private var wantsVideoList: Bool {
+        onVideosSelected != nil || onPickedVideos != nil
+    }
+
     private var isMultiSelect: Bool {
-        (onImagesSelected != nil || onVideosSelected != nil) && selectionLimit != 1
+        (onImagesSelected != nil || onPickedImages != nil || wantsVideoList) && selectionLimit != 1
     }
 
     public var body: some View {
@@ -226,19 +245,23 @@ public struct PhotoLibraryPicker: View {
         showingAlbumsSheet = false
         isProcessing = true
         Task {
-            if asset.mediaType == .video, let onVideoSelected {
+            if asset.mediaType == .video, onVideoSelected != nil || onPickedVideos != nil {
                 let url = await model.exportVideo(for: asset)
                 await MainActor.run {
-                    if let url { onVideoSelected(url) }
+                    if let url {
+                        onVideoSelected?(url)
+                        onPickedVideos?([PickedVideo(url: url, assetIdentifier: asset.localIdentifier)])
+                    }
                     isProcessing = false
                     dismiss()
                 }
-            } else if onImageSelected != nil || onImagesSelected != nil {
+            } else if wantsImages {
                 let image = await model.fullImage(for: asset)
                 await MainActor.run {
                     if let image {
                         onImageSelected?(image)
                         onImagesSelected?([image])
+                        onPickedImages?([PickedImage(image: image, assetIdentifier: asset.localIdentifier)])
                     }
                     isProcessing = false
                     dismiss()
@@ -261,25 +284,29 @@ public struct PhotoLibraryPicker: View {
         isProcessing = true
         Task {
             let assets = model.selectedAssets
-            let videoAssets = onVideosSelected != nil ? assets.filter { $0.mediaType == .video } : []
-            var videos: [URL] = []
+            let videoAssets = wantsVideoList ? assets.filter { $0.mediaType == .video } : []
+            var videos: [PickedVideo] = []
             videos.reserveCapacity(videoAssets.count)
             for asset in videoAssets {
                 if let url = await model.exportVideo(for: asset) {
-                    videos.append(url)
+                    videos.append(PickedVideo(url: url, assetIdentifier: asset.localIdentifier))
                 }
             }
-            let images: [UIImage]
-            if videos.isEmpty, onImagesSelected != nil {
-                images = await model.fullImages(for: assets.filter { $0.mediaType == .image })
-            } else {
-                images = []
+            var images: [PickedImage] = []
+            if videos.isEmpty, onImagesSelected != nil || onPickedImages != nil {
+                for asset in assets where asset.mediaType == .image {
+                    if let image = await model.fullImage(for: asset) {
+                        images.append(PickedImage(image: image, assetIdentifier: asset.localIdentifier))
+                    }
+                }
             }
             await MainActor.run {
                 if !videos.isEmpty {
-                    onVideosSelected?(videos)
+                    onVideosSelected?(videos.map(\.url))
+                    onPickedVideos?(videos)
                 } else {
-                    onImagesSelected?(images)
+                    onImagesSelected?(images.map(\.image))
+                    onPickedImages?(images)
                 }
                 isProcessing = false
                 dismiss()
@@ -903,22 +930,7 @@ final class PhotoLibraryModel: ObservableObject {
     }
 
     func fullImage(for asset: PHAsset) async -> UIImage? {
-        let resumer = ResumeOnce<UIImage?>()
-        return await withCheckedContinuation { (continuation: CheckedContinuation<UIImage?, Never>) in
-            let options = PHImageRequestOptions()
-            options.deliveryMode = .highQualityFormat
-            options.isNetworkAccessAllowed = true
-            options.version = .current
-            PHImageManager.default().requestImageDataAndOrientation(
-                for: asset,
-                options: options
-            ) { data, _, _, info in
-                let isDegraded = (info?[PHImageResultIsDegradedKey] as? Bool) ?? false
-                if isDegraded { return }
-                let image = data.flatMap { UIImage(data: $0) }
-                resumer.tryResume(continuation, with: image)
-            }
-        }
+        await PhotoLibraryAssets.fullImage(for: asset)
     }
 
     func fullImages(for assets: [PHAsset]) async -> [UIImage] {
@@ -933,37 +945,7 @@ final class PhotoLibraryModel: ObservableObject {
     }
 
     func exportVideo(for asset: PHAsset) async -> URL? {
-        // Ask PhotoKit to compose the asset with its *current* adjustments
-        // applied (trims, etc). Picking the `.video` PHAssetResource and
-        // writing its raw bytes would always return the unedited original,
-        // since edits in Photos are stored as a separate adjustment layer.
-        let options = PHVideoRequestOptions()
-        options.isNetworkAccessAllowed = true
-        options.deliveryMode = .highQualityFormat
-        options.version = .current
-
-        let dest = FileManager.default.temporaryDirectory
-            .appendingPathComponent("photopicker-\(UUID().uuidString).mov")
-        try? FileManager.default.removeItem(at: dest)
-
-        let resumer = ResumeOnce<AVAssetExportSession?>()
-        let session = await withCheckedContinuation { (continuation: CheckedContinuation<AVAssetExportSession?, Never>) in
-            PHImageManager.default().requestExportSession(
-                forVideo: asset,
-                options: options,
-                exportPreset: AVAssetExportPresetPassthrough
-            ) { session, _ in
-                resumer.tryResume(continuation, with: session)
-            }
-        }
-        guard let session else { return nil }
-
-        do {
-            try await session.export(to: dest, as: .mov)
-            return dest
-        } catch {
-            return nil
-        }
+        await PhotoLibraryAssets.exportVideo(for: asset)
     }
 }
 
@@ -1232,7 +1214,7 @@ enum PhotoLibraryFetcher {
 /// Resumes a continuation at most once. PhotoKit callbacks may fire multiple
 /// times (degraded → high-quality), and `withCheckedContinuation` traps on
 /// double-resume.
-private final class ResumeOnce<T>: @unchecked Sendable {
+final class ResumeOnce<T>: @unchecked Sendable {
     private let lock = NSLock()
     private var didResume = false
 

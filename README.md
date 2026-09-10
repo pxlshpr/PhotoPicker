@@ -73,6 +73,25 @@ PhotoLibraryPicker(
 )
 ```
 
+### Keep the library identifier, fetch the asset again later
+
+`onPickedImages` / `onPickedVideos` deliver each pick with its `PHAsset.localIdentifier`. Store it, and the same asset can be fetched again later — as long as it's still in the library:
+
+```swift
+PhotoLibraryPicker(
+    filter: .videos,
+    selectionLimit: 0,
+    onPickedVideos: { picks in
+        // picks: [PickedVideo] — .url (temp file) + .assetIdentifier
+    }
+)
+
+if PhotoLibraryAssets.contains([identifier]) {
+    let url = await PhotoLibraryAssets.exportVideo(localIdentifier: identifier)
+    let image = await PhotoLibraryAssets.image(localIdentifier: identifier)
+}
+```
+
 ### Prewarm at app launch
 
 The grid feels significantly faster if you call the prewarmer ~1.5s after launch (off the main thread's critical path):
